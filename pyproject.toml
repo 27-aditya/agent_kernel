@@ -15,3 +15,4 @@ dependencies = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "--cov=agent_kernel --cov-report=term-missing --cov-fail-under=90"

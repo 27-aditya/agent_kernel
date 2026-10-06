@@ -1,10 +1,8 @@
-import json
 import logging
 
 import httpx
 import pytest
 from pydantic import ValidationError
-from unittest.mock import AsyncMock, patch, MagicMock
 
 from agent_kernel import (
     AuditEntry,
@@ -16,67 +14,8 @@ from agent_kernel import (
     ResponseParseError,
     VALID_TOOLS,
 )
-from agent_kernel.models import JevChoiceOutput, JevNoulOutput, JevParallelResponse, JevScoreOutput
-
-
-# ── Builders ────────────────────────────────────────────────────────────────
-
-def choice(selected: str = "read_file", conf: float = 0.95) -> dict:
-    return {
-        "type": "choice",
-        "content": {"selected_option": selected, "confidence": conf, "reasoning": "r"},
-    }
-
-
-def noul(prob: float = 0.10) -> dict:
-    return {"type": "noul", "content": {"probability": prob, "reasoning": "r"}}
-
-
-def score(value: float = 1.0) -> dict:
-    return {"type": "score", "content": {"score": value, "reasoning": "r"}}
-
-
-def default_payload() -> dict:
-    return {"choices": [choice(), noul(), score()]}
-
-
-def make_action(tool_name: str = "read_file") -> ProposedAction:
-    return ProposedAction(
-        tool_name=tool_name,
-        arguments={"path": "/test"},
-        rationale="testing",
-        current_task="test",
-        execution_history=[],
-    )
-
-
-def make_response(
-    selected: str = "read_file",
-    conf: float = 0.95,
-    prob: float = 0.10,
-    blast: float = 1.0,
-) -> JevParallelResponse:
-    return JevParallelResponse(
-        valid_tool=JevChoiceOutput(selected_option=selected, confidence=conf, reasoning=""),
-        is_destructive=JevNoulOutput(probability=prob, reasoning=""),
-        blast_radius=JevScoreOutput(score=blast, reasoning=""),
-    )
-
-
-def mock_http(payload: dict | None = None, status_code: int = 200,
-              json_error: Exception | None = None) -> MagicMock:
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.raise_for_status.return_value = None
-    if json_error is not None:
-        resp.json.side_effect = json_error
-    else:
-        resp.json.return_value = payload if payload is not None else default_payload()
-    return resp
-
-
-def http_error(resp: MagicMock) -> httpx.HTTPStatusError:
-    return httpx.HTTPStatusError("server error", request=MagicMock(), response=resp)
+from agent_kernel.models import JevChoiceOutput, JevNoulOutput, JevScoreOutput
+from tests.helpers import choice, make_action, make_engine, make_response, noul, payload, score
 
 
 # ── Policy tests ────────────────────────────────────────────────────────────
@@ -229,112 +168,87 @@ class TestModels:
 class TestJevSupervisorEngine:
     @pytest.mark.asyncio
     async def test_evaluate_returns_valid_response(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http())) as post:
-            result = await engine.evaluate(make_action())
-            assert result.valid_tool.selected_option == "read_file"
-            assert result.is_destructive.probability == 0.10
-            assert result.blast_radius.score == 1.0
-            assert post.await_count == 1
+        engine, judge = make_engine(max_retries=0)
+        result = await engine.evaluate(make_action())
+        assert result.valid_tool.selected_option == "read_file"
+        assert result.is_destructive.probability == 0.10
+        assert result.blast_radius.score == 1.0
+        assert len(judge.requests) == 1
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_returns_decision_result(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http())):
-            decision = await engine.decide(make_action())
-            assert isinstance(decision, DecisionResult)
-            assert decision.verdict == "ALLOW"
-            assert decision.selected_tool == "read_file"
-            assert decision.risk_score == 1.0
-            assert decision.confidence == 0.95
-            assert "ALLOWED" in decision.reason
+        engine, _ = make_engine(max_retries=0)
+        decision = await engine.decide(make_action())
+        assert isinstance(decision, DecisionResult)
+        assert decision.verdict == "ALLOW"
+        assert decision.selected_tool == "read_file"
+        assert decision.risk_score == 1.0
+        assert decision.confidence == 0.95
+        assert "ALLOWED" in decision.reason
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_blocks_destructive(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("run_bash", 0.99), noul(0.95), score(5.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="run_bash"))
-            assert decision.verdict == "BLOCK"
+        engine, _ = make_engine(script=[payload("run_bash", 0.99, 0.95, 5.0)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="run_bash"))
+        assert decision.verdict == "BLOCK"
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_escalates_uncertain_zone(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("write_file", 0.90), noul(0.60), score(2.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="write_file"))
-            assert decision.verdict == "ESCALATE"
-            assert "uncertain zone" in decision.reason.lower()
+        engine, _ = make_engine(script=[payload("write_file", 0.90, 0.60, 2.0)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="write_file"))
+        assert decision.verdict == "ESCALATE"
+        assert "uncertain zone" in decision.reason.lower()
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_escalates_low_tool_confidence(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("run_bash", 0.50), noul(0.20), score(2.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="run_bash"))
-            assert decision.verdict == "ESCALATE"
-            assert "valid_tool confidence" in decision.reason.lower()
+        engine, _ = make_engine(script=[payload("run_bash", 0.50, 0.20, 2.0)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="run_bash"))
+        assert decision.verdict == "ESCALATE"
+        assert "valid_tool confidence" in decision.reason.lower()
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_escalates_high_blast_radius(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("run_bash", 0.90), noul(0.30), score(4.5)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="run_bash"))
-            assert decision.verdict == "ESCALATE"
-            assert decision.risk_score == 4.5
+        engine, _ = make_engine(script=[payload("run_bash", 0.90, 0.30, 4.5)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="run_bash"))
+        assert decision.verdict == "ESCALATE"
+        assert decision.risk_score == 4.5
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_escalates_unauthorized_tool(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("unauthorized_tool", 0.99), noul(0.05), score(1.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="web_search"))
-            assert decision.verdict == "ESCALATE"
-            assert "unauthorized_tool" in decision.reason
+        engine, _ = make_engine(script=[payload("unauthorized_tool", 0.99, 0.05, 1.0)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="web_search"))
+        assert decision.verdict == "ESCALATE"
+        assert "unauthorized_tool" in decision.reason
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_escalates_tool_mismatch(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("write_file", 0.99), noul(0.05), score(1.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="run_bash"))
-            assert decision.verdict == "ESCALATE"
-            assert "write_file" in decision.reason
+        engine, _ = make_engine(script=[payload("write_file", 0.99, 0.05, 1.0)], max_retries=0)
+        decision = await engine.decide(make_action(tool_name="run_bash"))
+        assert decision.verdict == "ESCALATE"
+        assert "write_file" in decision.reason
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_uses_injected_policy(self):
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost",
+        engine, _ = make_engine(
+            script=[payload("run_bash", 0.95, 0.10, 4.0)],
             max_retries=0,
             policy=PolicyGater(PolicyThresholds(escalate_blast_radius=4.5)),
         )
-        payload = {"choices": [choice("run_bash", 0.95), noul(0.10), score(4.0)]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action(tool_name="run_bash"))
-            assert decision.verdict == "ALLOW"
+        decision = await engine.decide(make_action(tool_name="run_bash"))
+        assert decision.verdict == "ALLOW"
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_build_prompt_contains_criteria(self):
-        engine = JevSupervisorEngine()
+        engine, _ = make_engine()
         prompt = engine._build_prompt(make_action(tool_name="run_bash"))
         assert "valid_tool" in prompt
         assert "unauthorized_tool" in prompt
@@ -347,20 +261,40 @@ class TestJevSupervisorEngine:
 
     @pytest.mark.asyncio
     async def test_raise_on_http_error(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        bad = mock_http(status_code=500)
-        bad.raise_for_status.side_effect = http_error(bad)
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=bad)):
-            with pytest.raises(httpx.HTTPStatusError):
-                await engine.evaluate(make_action())
+        engine, judge = make_engine(script=[(500, {"error": "boom"})], max_retries=0)
+        with pytest.raises(httpx.HTTPStatusError):
+            await engine.evaluate(make_action())
+        assert len(judge.requests) == 1
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_context_manager_closes_client(self):
-        async with JevSupervisorEngine(api_base_url="http://localhost") as engine:
+        engine, _ = make_engine()
+        async with engine:
             client = engine._get_client()
             assert not client.is_closed
         assert client.is_closed
+
+    @pytest.mark.asyncio
+    async def test_client_is_reused_across_calls(self):
+        engine, judge = make_engine(max_retries=0)
+        first = engine._get_client()
+        second = engine._get_client()
+        assert first is second
+        await engine.evaluate(make_action())
+        assert len(judge.requests) == 1
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_fresh_client_after_close(self):
+        engine, _ = make_engine()
+        first = engine._get_client()
+        await engine.close()
+        assert first.is_closed
+        second = engine._get_client()
+        assert second is not first
+        assert not second.is_closed
+        await engine.close()
 
 
 # ── Response parsing tests ──────────────────────────────────────────────────
@@ -415,37 +349,30 @@ class TestResponseParsing:
     ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("payload,fragment", BAD_PAYLOADS)
-    async def test_evaluate_raises_on_bad_payload(self, payload, fragment):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            with pytest.raises(ResponseParseError) as exc:
-                await engine.evaluate(make_action())
-            assert fragment in str(exc.value)
+    @pytest.mark.parametrize("bad_payload,fragment", BAD_PAYLOADS)
+    async def test_evaluate_raises_on_bad_payload(self, bad_payload, fragment):
+        engine, _ = make_engine(script=[bad_payload], max_retries=0)
+        with pytest.raises(ResponseParseError) as exc:
+            await engine.evaluate(make_action())
+        assert fragment in str(exc.value)
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_evaluate_raises_on_non_json_body(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        resp = mock_http(json_error=ValueError("no json here"))
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=resp)):
-            with pytest.raises(ResponseParseError) as exc:
-                await engine.evaluate(make_action())
-            assert "not valid JSON" in str(exc.value)
+        engine, _ = make_engine(script=[b"<html>nope</html>"], max_retries=0)
+        with pytest.raises(ResponseParseError) as exc:
+            await engine.evaluate(make_action())
+        assert "not valid JSON" in str(exc.value)
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_decide_fails_closed_on_malformed_response(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice(), noul()]}
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=mock_http(payload))):
-            decision = await engine.decide(make_action())
-            assert isinstance(decision, DecisionResult)
-            assert decision.verdict == "ESCALATE"
-            assert "malformed" in decision.reason
-            assert decision.confidence == 0.0
+        engine, _ = make_engine(script=[{"choices": [choice(), noul()]}], max_retries=0)
+        decision = await engine.decide(make_action())
+        assert isinstance(decision, DecisionResult)
+        assert decision.verdict == "ESCALATE"
+        assert "malformed" in decision.reason
+        assert decision.confidence == 0.0
         await engine.close()
 
 
@@ -454,105 +381,78 @@ class TestResponseParsing:
 class TestHttpResilience:
     @pytest.mark.asyncio
     async def test_retries_retryable_status_then_succeeds(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=2, backoff_base=0)
-        server_error = mock_http(status_code=500)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(side_effect=[server_error, mock_http()])) as post:
-            result = await engine.evaluate(make_action())
-            assert result.valid_tool.selected_option == "read_file"
-            assert post.await_count == 2
+        engine, judge = make_engine(
+            script=[(500, {"error": "transient"}), payload()], max_retries=2, backoff_base=0
+        )
+        result = await engine.evaluate(make_action())
+        assert result.valid_tool.selected_option == "read_file"
+        assert len(judge.requests) == 2
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_retries_exhausted_raises_http_error(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=1, backoff_base=0)
-        bad = mock_http(status_code=503)
-        bad.raise_for_status.side_effect = http_error(bad)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(side_effect=[bad, bad])) as post:
-            with pytest.raises(httpx.HTTPStatusError):
-                await engine.evaluate(make_action())
-            assert post.await_count == 2
+        engine, judge = make_engine(
+            script=[(503, {"error": "down"}), (503, {"error": "down"})], max_retries=1, backoff_base=0
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await engine.evaluate(make_action())
+        assert len(judge.requests) == 2
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_non_retryable_status_raises_immediately(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=3, backoff_base=0)
-        bad = mock_http(status_code=401)
-        bad.raise_for_status.side_effect = http_error(bad)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(return_value=bad)) as post:
-            with pytest.raises(httpx.HTTPStatusError):
-                await engine.evaluate(make_action())
-            assert post.await_count == 1
+        engine, judge = make_engine(script=[(401, {"error": "bad key"})], max_retries=3, backoff_base=0)
+        with pytest.raises(httpx.HTTPStatusError):
+            await engine.evaluate(make_action())
+        assert len(judge.requests) == 1
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_retries_transport_error_then_succeeds(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=2, backoff_base=0)
-        request = httpx.Request("POST", "http://localhost/v1/chat")
-        connect_error = httpx.ConnectError("connection refused", request=request)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(side_effect=[connect_error, mock_http()])) as post:
-            result = await engine.evaluate(make_action())
-            assert result.blast_radius.score == 1.0
-            assert post.await_count == 2
+        engine, judge = make_engine(
+            script=[httpx.ConnectError, payload()], max_retries=2, backoff_base=0
+        )
+        result = await engine.evaluate(make_action())
+        assert result.blast_radius.score == 1.0
+        assert len(judge.requests) == 2
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_transport_error_exhausted_raises(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=1, backoff_base=0)
-        request = httpx.Request("POST", "http://localhost/v1/chat")
-        connect_error = httpx.ConnectError("connection refused", request=request)
-        with patch.object(engine._get_client(), "post",
-                          new=AsyncMock(side_effect=[connect_error, connect_error])) as post:
-            with pytest.raises(httpx.ConnectError):
-                await engine.evaluate(make_action())
-            assert post.await_count == 2
+        engine, judge = make_engine(
+            script=[httpx.ConnectError, httpx.ConnectError], max_retries=1, backoff_base=0
+        )
+        with pytest.raises(httpx.ConnectError):
+            await engine.evaluate(make_action())
+        assert len(judge.requests) == 2
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_api_key_sent_and_extra_body_merged(self, monkeypatch):
         monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
-        seen: dict = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["authorization"] = request.headers.get("authorization")
-            seen["body"] = json.loads(request.content)
-            return httpx.Response(200, json=default_payload())
-
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost",
-            api_key="sk-test",
-            extra_body={"response_format": {"type": "json_object"}},
-        )
-        engine._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        engine, judge = make_engine(max_retries=0, api_key="sk-test",
+                                    extra_body={"response_format": {"type": "json_object"}})
         await engine.evaluate(make_action())
-        assert seen["authorization"] == "Bearer sk-test"
-        assert seen["body"]["model"] == "jev-latest"
-        assert seen["body"]["response_format"] == {"type": "json_object"}
-        assert "content" in seen["body"]["messages"][0]
+        request = judge.requests[0]
+        body = judge.bodies[0]
+        assert request.headers["authorization"] == "Bearer sk-test"
+        assert body["model"] == "jev-latest"
+        assert body["response_format"] == {"type": "json_object"}
+        assert "content" in body["messages"][0]
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_no_auth_header_without_key(self, monkeypatch):
         monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
-        seen: dict = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["authorization"] = request.headers.get("authorization")
-            return httpx.Response(200, json=default_payload())
-
-        engine = JevSupervisorEngine(api_base_url="http://localhost")
-        engine._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        engine, judge = make_engine(max_retries=0)
         await engine.evaluate(make_action())
-        assert seen["authorization"] is None
+        assert "authorization" not in judge.requests[0].headers
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_api_key_from_environment(self, monkeypatch):
         monkeypatch.setenv("AGENT_KERNEL_API_KEY", "sk-env")
-        engine = JevSupervisorEngine(api_base_url="http://localhost")
+        engine = JevSupervisorEngine(api_base_url="http://judge.test")
         assert engine.api_key == "sk-env"
         assert engine._headers() == {"Authorization": "Bearer sk-env"}
         await engine.close()
@@ -563,9 +463,8 @@ class TestHttpResilience:
 class TestObservability:
     @pytest.mark.asyncio
     async def test_audit_entry_recorded(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
-            decision = await engine.decide(make_action())
+        engine, _ = make_engine(max_retries=0)
+        decision = await engine.decide(make_action())
         entries = engine.audit
         assert len(entries) == 1
         entry = entries[0]
@@ -581,13 +480,9 @@ class TestObservability:
     @pytest.mark.asyncio
     async def test_on_decision_hook_receives_every_entry(self):
         collected: list[AuditEntry] = []
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost", max_retries=0, on_decision=collected.append
-        )
+        engine, _ = make_engine(max_retries=0, on_decision=collected.append)
         for _ in range(2):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(return_value=mock_http())):
-                await engine.decide(make_action())
+            await engine.decide(make_action())
         assert collected == list(engine.audit)
         assert len(collected) == 2
         await engine.close()
@@ -597,27 +492,19 @@ class TestObservability:
         def boom(entry: AuditEntry) -> None:
             raise RuntimeError("hook exploded")
 
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost", max_retries=0, on_decision=boom
-        )
+        engine, _ = make_engine(max_retries=0, on_decision=boom)
         with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(return_value=mock_http())):
-                decision = await engine.decide(make_action())
+            decision = await engine.decide(make_action())
         assert decision.verdict == "ALLOW"
         assert any("on_decision hook raised" in r.getMessage() for r in caplog.records)
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_audit_history_is_bounded(self):
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost", max_retries=0, audit_history_limit=2
-        )
+        engine, _ = make_engine(max_retries=0, audit_history_limit=2)
         request_ids = []
         for _ in range(3):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(return_value=mock_http())):
-                await engine.decide(make_action())
+            await engine.decide(make_action())
             request_ids.append(engine.audit[-1].request_id)
         assert len(engine.audit) == 2
         assert [e.request_id for e in engine.audit] == request_ids[1:]
@@ -626,21 +513,17 @@ class TestObservability:
     @pytest.mark.asyncio
     async def test_audit_history_can_be_disabled_but_hook_still_fires(self):
         collected: list[AuditEntry] = []
-        engine = JevSupervisorEngine(
-            api_base_url="http://localhost", max_retries=0,
-            audit_history_limit=0, on_decision=collected.append,
-        )
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
-            await engine.decide(make_action())
+        engine, _ = make_engine(max_retries=0, audit_history_limit=0,
+                                on_decision=collected.append)
+        await engine.decide(make_action())
         assert engine.audit == ()
         assert len(collected) == 1
         await engine.close()
 
     @pytest.mark.asyncio
     async def test_clear_audit(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
-            await engine.decide(make_action())
+        engine, _ = make_engine(max_retries=0)
+        await engine.decide(make_action())
         assert len(engine.audit) == 1
         engine.clear_audit()
         assert engine.audit == ()
@@ -648,10 +531,9 @@ class TestObservability:
 
     @pytest.mark.asyncio
     async def test_request_ids_are_unique_per_decision(self):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
-            first = await engine.decide(make_action())
-            second = await engine.decide(make_action())
+        engine, _ = make_engine(max_retries=0)
+        await engine.decide(make_action())
+        await engine.decide(make_action())
         ids = [e.request_id for e in engine.audit]
         assert len(set(ids)) == 2
         await engine.close()
@@ -668,12 +550,9 @@ class TestObservability:
     async def test_decision_log_level_and_structured_fields(
         self, caplog, prob, conf, blast, expected_verdict, expected_level, expected_risk
     ):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice("read_file", conf), noul(prob), score(blast)]}
+        engine, _ = make_engine(script=[payload("read_file", conf, prob, blast)], max_retries=0)
         with caplog.at_level(logging.DEBUG, logger="agent_kernel.engine"):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(return_value=mock_http(payload))):
-                decision = await engine.decide(make_action())
+            decision = await engine.decide(make_action())
         assert decision.verdict == expected_verdict
         record = next(
             r for r in caplog.records
@@ -693,11 +572,10 @@ class TestObservability:
 
     @pytest.mark.asyncio
     async def test_retry_logged_as_warning_with_context(self, caplog):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=1, backoff_base=0)
+        engine, _ = make_engine(script=[(500, {"error": "transient"}), payload()],
+                                max_retries=1, backoff_base=0)
         with caplog.at_level(logging.WARNING, logger="agent_kernel.engine"):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(side_effect=[mock_http(status_code=500), mock_http()])):
-                await engine.evaluate(make_action())
+            await engine.evaluate(make_action())
         retry = [r for r in caplog.records if getattr(r, "attempt", None) == 1]
         assert retry, "expected a retry log record"
         assert retry[0].levelno == logging.WARNING
@@ -707,12 +585,9 @@ class TestObservability:
 
     @pytest.mark.asyncio
     async def test_malformed_response_logs_error_and_still_escalates(self, caplog):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        payload = {"choices": [choice(), noul()]}
+        engine, _ = make_engine(script=[{"choices": [choice(), noul()]}], max_retries=0)
         with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
-            with patch.object(engine._get_client(), "post",
-                              new=AsyncMock(return_value=mock_http(payload))):
-                decision = await engine.decide(make_action())
+            decision = await engine.decide(make_action())
         assert decision.verdict == "ESCALATE"
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any("malformed response" in r.getMessage() for r in errors)
@@ -722,13 +597,10 @@ class TestObservability:
 
     @pytest.mark.asyncio
     async def test_http_error_logged_with_status(self, caplog):
-        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
-        bad = mock_http(status_code=500)
-        bad.raise_for_status.side_effect = http_error(bad)
+        engine, _ = make_engine(script=[(500, {"error": "boom"})], max_retries=0)
         with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
-            with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=bad)):
-                with pytest.raises(httpx.HTTPStatusError):
-                    await engine.evaluate(make_action())
+            with pytest.raises(httpx.HTTPStatusError):
+                await engine.evaluate(make_action())
         errors = [r for r in caplog.records if getattr(r, "status_code", None) == 500]
         assert errors and errors[0].levelno == logging.ERROR
         await engine.close()

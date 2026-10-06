@@ -150,19 +150,28 @@ The project targets Python >= 3.11 and is developed inside WSL Debian.
 cd ~/agent_kernel
 python3 -m venv .venv
 .venv/bin/pip install -e . pytest pytest-asyncio pytest-cov
-.venv/bin/python -m pytest -q
-.venv/bin/python -m pytest -q --cov=agent_kernel --cov-report=term-missing
+.venv/bin/python -m pytest
 ```
 
-Two test files:
+A plain `pytest` run is the full gate: **all tests must pass and coverage of
+`agent_kernel` must stay >= 90%** (`addopts` in `pyproject.toml` wires
+`--cov=agent_kernel --cov-fail-under=90`). Use `pytest --no-cov` when iterating on a
+single test, since a partial run cannot meet the coverage gate.
+
+> If the repo lives on a WSL mount and you run pytest from Windows, set
+> `COVERAGE_FILE` to a local directory first — sqlite (used by coverage) cannot lock
+> reliably over `\\wsl.localhost`.
+
+Test layout:
 
 - `tests/test_engine.py` — policy gate (threshold boundaries, custom thresholds,
   unauthorized/mismatch rules), models (range and registry validation), prompt
   construction, response parsing, fail-closed `decide()`, HTTP retries/auth/pass-through,
-  and observability (audit entries, hooks, log levels and fields).
+  client lifecycle, and observability (audit entries, hooks, log levels and fields).
 - `tests/test_http_integration.py` — end-to-end runs against a local judge server over
   a real socket: retries, bearer auth, request body, malformed bodies, HTTP errors, and
   connection failures.
-
-Network calls are always mocked or looped back to localhost — the suite never hits a
-live endpoint.
+- `tests/helpers.py` — shared builders plus `ScriptedJudge`, an `httpx.MockTransport`
+  handler that replays scripted `(status, body)` responses and records every request.
+  Unit tests never touch a socket; integration tests loop back to localhost — the suite
+  never hits a live endpoint.
