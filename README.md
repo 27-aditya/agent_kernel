@@ -225,7 +225,7 @@ The project targets Python >= 3.11 and is developed inside WSL Debian.
 ```bash
 cd ~/agent_kernel
 python3 -m venv .venv
-.venv/bin/pip install -e . pytest pytest-asyncio pytest-cov ruff mypy
+.venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest     # full gate: tests + coverage
 .venv/bin/ruff check .         # lint (ruff config in pyproject.toml)
 .venv/bin/mypy                 # typecheck (strict, package only)
