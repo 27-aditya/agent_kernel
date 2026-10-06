@@ -58,5 +58,13 @@ class AuditEntry(BaseModel):
     timestamp: datetime
     model_alias: str
     latency_ms: float
+    escalated: bool = False
+    action: ProposedAction
+    decision: DecisionResult
+
+
+class EscalationRequest(BaseModel):
+    request_id: str
+    raised_at: datetime
     action: ProposedAction
     decision: DecisionResult

@@ -1,25 +1,28 @@
 import asyncio
+import inspect
 import logging
 import os
 import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from pydantic import ValidationError
 
-from agent_kernel.exceptions import ResponseParseError
+from agent_kernel.exceptions import ActionBlocked, ResponseParseError
 from agent_kernel.models import (
     VALID_TOOLS,
     AuditEntry,
     DecisionResult,
+    EscalationRequest,
     JevChoiceOutput,
     JevNoulOutput,
     JevParallelResponse,
     JevScoreOutput,
     ProposedAction,
+    Verdict,
 )
 from agent_kernel.policy import PolicyGater
 
@@ -28,6 +31,10 @@ logger = logging.getLogger("agent_kernel.engine")
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 _VERDICT_LOG_LEVELS = {"ALLOW": logging.INFO, "ESCALATE": logging.WARNING, "BLOCK": logging.ERROR}
+
+EscalationHandler = Callable[[EscalationRequest], "Verdict | Awaitable[Verdict]"]
+DecisionHook = Callable[[AuditEntry], None]
+Executor = Callable[[ProposedAction], "Any | Awaitable[Any]"]
 
 
 class JevSupervisorEngine:
@@ -41,7 +48,8 @@ class JevSupervisorEngine:
         backoff_base: float = 0.5,
         extra_body: Optional[dict[str, Any]] = None,
         policy: Optional[PolicyGater] = None,
-        on_decision: Optional[Callable[[AuditEntry], None]] = None,
+        on_decision: Optional[DecisionHook] = None,
+        escalation_handler: Optional[EscalationHandler] = None,
         audit_history_limit: int = 1000,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
@@ -53,6 +61,7 @@ class JevSupervisorEngine:
         self.extra_body = dict(extra_body or {})
         self._policy = policy or PolicyGater()
         self._on_decision = on_decision
+        self._escalation_handler = escalation_handler
         self._audit: deque[AuditEntry] = deque(maxlen=max(0, audit_history_limit))
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -180,8 +189,75 @@ class JevSupervisorEngine:
                 confidence=jev_response.valid_tool.confidence,
                 reason=reason,
             )
-        self._record_audit(request_id, action, decision, time.perf_counter() - started)
+        escalated = False
+        if decision.verdict == "ESCALATE" and self._escalation_handler is not None:
+            decision, escalated = await self._resolve_escalation(request_id, action, decision)
+        self._record_audit(request_id, action, decision, time.perf_counter() - started, escalated)
         return decision
+
+    async def _resolve_escalation(
+        self,
+        request_id: str,
+        action: ProposedAction,
+        decision: DecisionResult,
+    ) -> tuple[DecisionResult, bool]:
+        """Hand an ESCALATE verdict to the escalation handler and apply its resolution.
+
+        The handler may be sync or async and must return ALLOW, ESCALATE, or BLOCK.
+        Anything else — including a handler that raises — keeps the ESCALATE verdict.
+        """
+        request = EscalationRequest(
+            request_id=request_id,
+            raised_at=datetime.now(timezone.utc),
+            action=action,
+            decision=decision,
+        )
+        logger.warning(
+            "decision %s escalated — awaiting escalation handler", request_id,
+            extra={"request_id": request_id, "tool_name": action.tool_name,
+                   "verdict": decision.verdict},
+        )
+        try:
+            resolution = self._escalation_handler(request)
+            if inspect.isawaitable(resolution):
+                resolution = await resolution
+        except Exception:
+            logger.exception(
+                "escalation handler raised for request %s; keeping ESCALATE", request_id
+            )
+            return decision, True
+        if resolution in ("ALLOW", "BLOCK"):
+            return (
+                decision.model_copy(
+                    update={
+                        "verdict": resolution,
+                        "reason": f"{decision.reason} Escalation resolved to {resolution}.",
+                    }
+                ),
+                True,
+            )
+        if resolution != "ESCALATE":
+            logger.error(
+                "escalation handler returned %r for request %s; keeping ESCALATE",
+                resolution, request_id,
+                extra={"request_id": request_id},
+            )
+        return decision, True
+
+    async def execute(self, action: ProposedAction, executor: Executor) -> tuple[DecisionResult, Any]:
+        """Decide, then run ``executor(action)`` only if the verdict is ALLOW.
+
+        Raises ``ActionBlocked`` (carrying the decision) for BLOCK and ESCALATE
+        verdicts, so a guarded agent loop can never run unapproved work.
+        ``executor`` may be sync or async.
+        """
+        decision = await self.decide(action)
+        if decision.verdict != "ALLOW":
+            raise ActionBlocked(decision)
+        result = executor(action)
+        if inspect.isawaitable(result):
+            result = await result
+        return decision, result
 
     def _record_audit(
         self,
@@ -189,12 +265,14 @@ class JevSupervisorEngine:
         action: ProposedAction,
         decision: DecisionResult,
         latency_s: float,
+        escalated: bool = False,
     ) -> None:
         entry = AuditEntry(
             request_id=request_id,
             timestamp=datetime.now(timezone.utc),
             model_alias=self.model_alias,
             latency_ms=latency_s * 1000.0,
+            escalated=escalated,
             action=action,
             decision=decision,
         )
@@ -214,6 +292,7 @@ class JevSupervisorEngine:
                 "confidence": decision.confidence,
                 "latency_ms": entry.latency_ms,
                 "model_alias": self.model_alias,
+                "escalated": escalated,
                 "reason": decision.reason,
             },
         )

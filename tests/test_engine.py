@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_kernel import (
+    ActionBlocked,
     AuditEntry,
     DecisionResult,
     JevSupervisorEngine,
@@ -603,6 +604,193 @@ class TestObservability:
                 await engine.evaluate(make_action())
         errors = [r for r in caplog.records if getattr(r, "status_code", None) == 500]
         assert errors and errors[0].levelno == logging.ERROR
+        await engine.close()
+
+
+# ── Escalation workflow tests ───────────────────────────────────────────────
+
+ESCALATE_PAYLOAD = payload("read_file", 0.95, 0.60, 1.0)  # uncertain zone
+
+
+class TestEscalationWorkflow:
+    @pytest.mark.asyncio
+    async def test_handler_resolves_escalate_to_allow(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "ALLOW")
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "ALLOW"
+        assert "ESCALATE" in decision.reason
+        assert "Escalation resolved to ALLOW" in decision.reason
+        assert engine.audit[0].escalated is True
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_handler_resolves_escalate_to_block(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "BLOCK")
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "BLOCK"
+        assert "Escalation resolved to BLOCK" in decision.reason
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_handler_can_keep_escalate(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "ESCALATE")
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "ESCALATE"
+        assert "Escalation resolved" not in decision.reason
+        assert engine.audit[0].escalated is True
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_async_handler_supported(self):
+        seen = {}
+
+        async def async_handler(req):
+            seen["request_id"] = req.request_id
+            seen["action"] = req.action
+            seen["verdict"] = req.decision.verdict
+            return "ALLOW"
+
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=async_handler)
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "ALLOW"
+        assert seen["verdict"] == "ESCALATE"
+        assert seen["action"].tool_name == "read_file"
+        assert seen["request_id"] == engine.audit[0].request_id
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_invalid_handler_verdict_keeps_escalate(self, caplog):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "PERMIT")
+        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
+            decision = await engine.decide(make_action())
+        assert decision.verdict == "ESCALATE"
+        assert any("escalation handler returned 'PERMIT'" in r.getMessage()
+                   for r in caplog.records)
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_handler_exception_keeps_escalate(self, caplog):
+        def broken(req):
+            raise RuntimeError("review queue down")
+
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=broken)
+        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
+            decision = await engine.decide(make_action())
+        assert decision.verdict == "ESCALATE"
+        assert any("keeping ESCALATE" in r.getMessage() for r in caplog.records)
+        assert len(engine.audit) == 1
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_handler_not_called_when_allowed(self):
+        calls = []
+        engine, _ = make_engine(max_retries=0, escalation_handler=lambda req: calls.append(req))
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "ALLOW"
+        assert calls == []
+        assert engine.audit[0].escalated is False
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_escalation_logged_and_audited_once(self, caplog):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "ALLOW")
+        with caplog.at_level(logging.DEBUG, logger="agent_kernel.engine"):
+            await engine.decide(make_action())
+        escalations = [r for r in caplog.records if "awaiting escalation handler" in r.getMessage()]
+        assert len(escalations) == 1
+        assert escalations[0].request_id
+        decisions = [r for r in caplog.records if getattr(r, "verdict", None) == "ALLOW"]
+        assert decisions and decisions[0].escalated is True
+        assert len(engine.audit) == 1
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_no_handler_leaves_escalate(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0)
+        decision = await engine.decide(make_action())
+        assert decision.verdict == "ESCALATE"
+        assert engine.audit[0].escalated is False
+        await engine.close()
+
+
+# ── Executor integration tests ──────────────────────────────────────────────
+
+class TestExecute:
+    @pytest.mark.asyncio
+    async def test_execute_runs_executor_on_allow(self):
+        engine, _ = make_engine(max_retries=0)
+        calls = []
+
+        def executor(action):
+            calls.append(action.tool_name)
+            return "file contents"
+
+        decision, result = await engine.execute(make_action(), executor)
+        assert decision.verdict == "ALLOW"
+        assert result == "file contents"
+        assert calls == ["read_file"]
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_supports_async_executor(self):
+        engine, _ = make_engine(max_retries=0)
+
+        async def executor(action):
+            return {"status": "ok"}
+
+        _, result = await engine.execute(make_action(), executor)
+        assert result == {"status": "ok"}
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_raises_on_block(self):
+        engine, _ = make_engine(script=[payload("run_bash", 0.99, 0.95, 5.0)], max_retries=0)
+        calls = []
+
+        def executor(action):
+            calls.append(action)
+            return "should not run"
+
+        with pytest.raises(ActionBlocked) as exc:
+            await engine.execute(make_action(tool_name="run_bash"), executor)
+        assert exc.value.decision.verdict == "BLOCK"
+        assert calls == []
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_raises_on_escalate(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0)
+        calls = []
+
+        def executor(action):
+            calls.append(action)
+
+        with pytest.raises(ActionBlocked) as exc:
+            await engine.execute(make_action(), executor)
+        assert exc.value.decision.verdict == "ESCALATE"
+        assert calls == []
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_runs_after_escalation_resolution(self):
+        engine, _ = make_engine(script=[ESCALATE_PAYLOAD], max_retries=0,
+                                escalation_handler=lambda req: "ALLOW")
+
+        def executor(action):
+            return f"ran {action.tool_name}"
+
+        decision, result = await engine.execute(make_action(), executor)
+        assert decision.verdict == "ALLOW"
+        assert decision.reason  # escalation provenance preserved
+        assert result == "ran read_file"
+        assert engine.audit[0].escalated is True
         await engine.close()
 
 

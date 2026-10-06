@@ -142,6 +142,47 @@ engine.clear_audit()
   exception is logged and the decision is still returned — a broken audit sink can
   never block or alter governance.
 
+## Escalation and guarded execution
+
+### Escalation workflow
+
+`ESCALATE` verdicts can be routed to a reviewer — a human queue, an approval ticket,
+another model — by passing an `escalation_handler`. It receives an `EscalationRequest`
+(`request_id`, `raised_at`, `action`, and the `ESCALATE` `decision`) and returns
+`ALLOW`, `ESCALATE` (keep waiting), or `BLOCK`. It may be sync or async.
+
+```python
+from agent_kernel import JevSupervisorEngine
+
+async def review(request):
+    return "ALLOW" if await human_approved(request.request_id) else "BLOCK"
+
+engine = JevSupervisorEngine(escalation_handler=review)
+decision = await engine.decide(action)
+```
+
+- A handler that **raises** or returns an invalid verdict leaves the verdict at
+  `ESCALATE` (fail-safe) and logs the failure.
+- The resolution is recorded in `decision.reason` and the audit entry is marked
+  `escalated=True`, with a dedicated WARNING log line for the escalation itself.
+
+### Guarded execution
+
+`execute()` is the agent-loop integration point: it decides first and only runs the
+executor when the verdict is `ALLOW`.
+
+```python
+from agent_kernel import ActionBlocked
+
+try:
+    decision, result = await engine.execute(action, run_tool)   # sync or async executor
+except ActionBlocked as blocked:
+    handle(blocked.decision)  # .verdict, .reason, .risk_score, .confidence
+```
+
+`ActionBlocked` is raised for both `BLOCK` and `ESCALATE` (unless an escalation
+handler approved it), so unreviewed work can never reach the executor.
+
 ## Development
 
 The project targets Python >= 3.11 and is developed inside WSL Debian.
