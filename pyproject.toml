@@ -19,3 +19,15 @@ agent-kernel = "agent_kernel.cli:main"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "--cov=agent_kernel --cov-report=term-missing --cov-fail-under=90"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["agent_kernel"]

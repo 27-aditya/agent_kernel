@@ -1,10 +1,12 @@
 import logging
+from typing import ClassVar
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from agent_kernel import (
+    VALID_TOOLS,
     ActionBlocked,
     AuditEntry,
     DecisionResult,
@@ -13,11 +15,9 @@ from agent_kernel import (
     PolicyThresholds,
     ProposedAction,
     ResponseParseError,
-    VALID_TOOLS,
 )
 from agent_kernel.models import JevChoiceOutput, JevNoulOutput, JevScoreOutput
 from tests.helpers import choice, make_action, make_engine, make_response, noul, payload, score
-
 
 # ── Policy tests ────────────────────────────────────────────────────────────
 
@@ -143,7 +143,8 @@ class TestModels:
 
     @pytest.mark.parametrize("tool", list(VALID_TOOLS))
     def test_all_registry_tools_accepted(self, tool):
-        assert JevChoiceOutput(selected_option=tool, confidence=0.5, reasoning="").selected_option == tool
+        output = JevChoiceOutput(selected_option=tool, confidence=0.5, reasoning="")
+        assert output.selected_option == tool
 
     def test_unknown_tool_rejected(self):
         with pytest.raises(ValidationError):
@@ -222,7 +223,9 @@ class TestJevSupervisorEngine:
 
     @pytest.mark.asyncio
     async def test_decide_escalates_unauthorized_tool(self):
-        engine, _ = make_engine(script=[payload("unauthorized_tool", 0.99, 0.05, 1.0)], max_retries=0)
+        engine, _ = make_engine(
+            script=[payload("unauthorized_tool", 0.99, 0.05, 1.0)], max_retries=0
+        )
         decision = await engine.decide(make_action(tool_name="web_search"))
         assert decision.verdict == "ESCALATE"
         assert "unauthorized_tool" in decision.reason
@@ -301,7 +304,7 @@ class TestJevSupervisorEngine:
 # ── Response parsing tests ──────────────────────────────────────────────────
 
 class TestResponseParsing:
-    BAD_PAYLOADS = [
+    BAD_PAYLOADS: ClassVar[list] = [
         pytest.param(
             {"choices": [choice(), noul()]},
             "exactly one 'score'",
@@ -393,7 +396,9 @@ class TestHttpResilience:
     @pytest.mark.asyncio
     async def test_retries_exhausted_raises_http_error(self):
         engine, judge = make_engine(
-            script=[(503, {"error": "down"}), (503, {"error": "down"})], max_retries=1, backoff_base=0
+            script=[(503, {"error": "down"}), (503, {"error": "down"})],
+            max_retries=1,
+            backoff_base=0,
         )
         with pytest.raises(httpx.HTTPStatusError):
             await engine.evaluate(make_action())
@@ -402,7 +407,9 @@ class TestHttpResilience:
 
     @pytest.mark.asyncio
     async def test_non_retryable_status_raises_immediately(self):
-        engine, judge = make_engine(script=[(401, {"error": "bad key"})], max_retries=3, backoff_base=0)
+        engine, judge = make_engine(
+            script=[(401, {"error": "bad key"})], max_retries=3, backoff_base=0
+        )
         with pytest.raises(httpx.HTTPStatusError):
             await engine.evaluate(make_action())
         assert len(judge.requests) == 1
@@ -599,9 +606,11 @@ class TestObservability:
     @pytest.mark.asyncio
     async def test_http_error_logged_with_status(self, caplog):
         engine, _ = make_engine(script=[(500, {"error": "boom"})], max_retries=0)
-        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
-            with pytest.raises(httpx.HTTPStatusError):
-                await engine.evaluate(make_action())
+        with (
+            caplog.at_level(logging.ERROR, logger="agent_kernel.engine"),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await engine.evaluate(make_action())
         errors = [r for r in caplog.records if getattr(r, "status_code", None) == 500]
         assert errors and errors[0].levelno == logging.ERROR
         await engine.close()

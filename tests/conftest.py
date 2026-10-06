@@ -10,7 +10,7 @@ from tests.helpers import ScriptedJudge
 class _JudgeHandler(BaseHTTPRequestHandler):
     judge: ScriptedJudge
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         request = httpx.Request(

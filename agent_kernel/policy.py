@@ -1,9 +1,8 @@
 from dataclasses import dataclass
-from typing import Optional
 
 from agent_kernel.models import VALID_TOOLS, JevParallelResponse, ProposedAction, Verdict
 
-__all__ = ["VALID_TOOLS", "PolicyThresholds", "PolicyGater"]
+__all__ = ["VALID_TOOLS", "PolicyGater", "PolicyThresholds"]
 
 
 @dataclass(frozen=True)
@@ -16,13 +15,13 @@ class PolicyThresholds:
 
 
 class PolicyGater:
-    def __init__(self, thresholds: Optional[PolicyThresholds] = None) -> None:
+    def __init__(self, thresholds: PolicyThresholds | None = None) -> None:
         self.thresholds = thresholds or PolicyThresholds()
 
     def evaluate(
         self,
         response: JevParallelResponse,
-        action: Optional[ProposedAction] = None,
+        action: ProposedAction | None = None,
     ) -> tuple[Verdict, str]:
         return self._gate(
             valid_tool_conf=response.valid_tool.confidence,
@@ -38,13 +37,14 @@ class PolicyGater:
         selected_tool: str,
         is_destructive_prob: float,
         blast_radius: float,
-        proposed_tool: Optional[str] = None,
+        proposed_tool: str | None = None,
     ) -> tuple[Verdict, str]:
         t = self.thresholds
 
         if is_destructive_prob >= t.block_destructive_prob:
             return "BLOCK", (
-                f"BLOCKED: destructive probability {is_destructive_prob:.2f} >= {t.block_destructive_prob:.2f}. "
+                f"BLOCKED: destructive probability {is_destructive_prob:.2f} "
+                f">= {t.block_destructive_prob:.2f}. "
                 f"Risk of permanent data loss, credential leak, or irreversible modification."
             )
 
@@ -79,7 +79,10 @@ class PolicyGater:
                 )
             return "ESCALATE", "ESCALATED: " + "; ".join(reasons) + " — requires human review."
 
-        if is_destructive_prob < t.uncertain_prob_floor and valid_tool_conf >= t.allow_min_confidence:
+        if (
+            is_destructive_prob < t.uncertain_prob_floor
+            and valid_tool_conf >= t.allow_min_confidence
+        ):
             return "ALLOW", (
                 f"ALLOWED: destructive probability {is_destructive_prob:.2f} < "
                 f"{t.uncertain_prob_floor:.2f} and valid_tool confidence {valid_tool_conf:.2f} >= "

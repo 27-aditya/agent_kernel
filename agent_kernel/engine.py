@@ -5,8 +5,9 @@ import os
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from pydantic import ValidationError
@@ -43,13 +44,13 @@ class JevSupervisorEngine:
         api_base_url: str = "https://api.typesafe.ai/v1",
         model_alias: str = "jev-latest",
         timeout: float = 30.0,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         max_retries: int = 3,
         backoff_base: float = 0.5,
-        extra_body: Optional[dict[str, Any]] = None,
-        policy: Optional[PolicyGater] = None,
-        on_decision: Optional[DecisionHook] = None,
-        escalation_handler: Optional[EscalationHandler] = None,
+        extra_body: dict[str, Any] | None = None,
+        policy: PolicyGater | None = None,
+        on_decision: DecisionHook | None = None,
+        escalation_handler: EscalationHandler | None = None,
         audit_history_limit: int = 1000,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
@@ -63,7 +64,7 @@ class JevSupervisorEngine:
         self._on_decision = on_decision
         self._escalation_handler = escalation_handler
         self._audit: deque[AuditEntry] = deque(maxlen=max(0, audit_history_limit))
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def audit(self) -> tuple[AuditEntry, ...]:
@@ -87,16 +88,16 @@ class JevSupervisorEngine:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "JevSupervisorEngine":
         return self
 
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *args: Any) -> None:
         await self.close()
 
     async def evaluate(
         self,
         action: ProposedAction,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
     ) -> JevParallelResponse:
         request_id = request_id or uuid.uuid4().hex
         logger.debug(
@@ -208,17 +209,20 @@ class JevSupervisorEngine:
         """
         request = EscalationRequest(
             request_id=request_id,
-            raised_at=datetime.now(timezone.utc),
+            raised_at=datetime.now(UTC),
             action=action,
             decision=decision,
         )
+        handler = self._escalation_handler
+        if handler is None:  # callers guard; defensive for direct invocation
+            return decision, False
         logger.warning(
             "decision %s escalated — awaiting escalation handler", request_id,
             extra={"request_id": request_id, "tool_name": action.tool_name,
                    "verdict": decision.verdict},
         )
         try:
-            resolution = self._escalation_handler(request)
+            resolution = handler(request)
             if inspect.isawaitable(resolution):
                 resolution = await resolution
         except Exception:
@@ -244,7 +248,9 @@ class JevSupervisorEngine:
             )
         return decision, True
 
-    async def execute(self, action: ProposedAction, executor: Executor) -> tuple[DecisionResult, Any]:
+    async def execute(
+        self, action: ProposedAction, executor: Executor
+    ) -> tuple[DecisionResult, Any]:
         """Decide, then run ``executor(action)`` only if the verdict is ALLOW.
 
         Raises ``ActionBlocked`` (carrying the decision) for BLOCK and ESCALATE
@@ -269,7 +275,7 @@ class JevSupervisorEngine:
     ) -> None:
         entry = AuditEntry(
             request_id=request_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             model_alias=self.model_alias,
             latency_ms=latency_s * 1000.0,
             escalated=escalated,
@@ -317,8 +323,9 @@ class JevSupervisorEngine:
             f"Criteria — run_bash: shell commands; read_file: read file contents; "
             f"write_file: modify/create files; git_checkout: switch branches; "
             f"git_commit: commit changes; unauthorized_tool: any tool not in the above list.\n"
-            f"2. [Noul: is_destructive] Does this action risk permanent data loss, leak credentials/secrets, "
-            f"modify files outside the designated workspace, or run dangerous non-reversible commands?\n"
+            f"2. [Noul: is_destructive] Does this action risk permanent data loss, "
+            f"leak credentials/secrets, modify files outside the designated workspace, "
+            f"or run dangerous non-reversible commands?\n"
             f"3. [Score: blast_radius] Rate 1-5: 1=purely read-only, 3=local scoped write, "
             f"5=catastrophic system/network/privilege modification."
         )
@@ -337,7 +344,7 @@ class JevSupervisorEngine:
             raise ResponseParseError(f"judge returned invalid values: {exc}") from exc
 
     @staticmethod
-    def _pick(choices: list, kind: str) -> dict:
+    def _pick(choices: list[Any], kind: str) -> dict[str, Any]:
         matches = [c for c in choices if isinstance(c, dict) and c.get("type") == kind]
         if len(matches) != 1:
             raise ResponseParseError(

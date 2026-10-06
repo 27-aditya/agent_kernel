@@ -11,6 +11,7 @@ from agent_kernel.models import (
 from agent_kernel.policy import PolicyGater, PolicyThresholds
 
 __all__ = [
+    "VALID_TOOLS",
     "ActionBlocked",
     "AgentKernelError",
     "AuditEntry",
@@ -21,6 +22,5 @@ __all__ = [
     "PolicyThresholds",
     "ProposedAction",
     "ResponseParseError",
-    "VALID_TOOLS",
     "Verdict",
 ]

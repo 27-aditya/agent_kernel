@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from pydantic import ValidationError
 
@@ -85,7 +85,7 @@ async def _decide(args: argparse.Namespace, action: ProposedAction) -> DecisionR
         return await engine.decide(action)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         arguments = json.loads(args.arguments)

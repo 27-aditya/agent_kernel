@@ -20,7 +20,7 @@ class TestEndToEndOverRealSocket:
         response = await engine.evaluate(make_action())
         assert response.blast_radius.score == 1.0
         assert len(judge.requests) == 2
-        for request, body in zip(judge.requests, judge.bodies):
+        for request, body in zip(judge.requests, judge.bodies, strict=True):
             assert request.url.path == "/models/jev-latest/chat/completions"
             assert request.headers["authorization"] == "Bearer sk-e2e"
             assert body["model"] == "jev-latest"

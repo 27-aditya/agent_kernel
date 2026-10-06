@@ -3,7 +3,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-VALID_TOOLS = ("run_bash", "read_file", "write_file", "git_checkout", "git_commit", "unauthorized_tool")
+VALID_TOOLS = (
+    "run_bash",
+    "read_file",
+    "write_file",
+    "git_checkout",
+    "git_commit",
+    "unauthorized_tool",
+)
 
 Verdict = Literal["ALLOW", "ESCALATE", "BLOCK"]
 

@@ -225,8 +225,10 @@ The project targets Python >= 3.11 and is developed inside WSL Debian.
 ```bash
 cd ~/agent_kernel
 python3 -m venv .venv
-.venv/bin/pip install -e . pytest pytest-asyncio pytest-cov
-.venv/bin/python -m pytest
+.venv/bin/pip install -e . pytest pytest-asyncio pytest-cov ruff mypy
+.venv/bin/python -m pytest     # full gate: tests + coverage
+.venv/bin/ruff check .         # lint (ruff config in pyproject.toml)
+.venv/bin/mypy                 # typecheck (strict, package only)
 ```
 
 A plain `pytest` run is the full gate: **all tests must pass and coverage of
@@ -243,10 +245,15 @@ Test layout:
 - `tests/test_engine.py` — policy gate (threshold boundaries, custom thresholds,
   unauthorized/mismatch rules), models (range and registry validation), prompt
   construction, response parsing, fail-closed `decide()`, HTTP retries/auth/pass-through,
-  client lifecycle, and observability (audit entries, hooks, log levels and fields).
+  client lifecycle, observability (audit entries, hooks, log levels and fields),
+  escalation workflow, and guarded `execute()`.
+- `tests/test_cli.py` — CLI exit codes (0/1/3/4), JSON output, argument validation,
+  interactive escalation (including via `python -m agent_kernel` subprocesses).
 - `tests/test_http_integration.py` — end-to-end runs against a local judge server over
   a real socket: retries, bearer auth, request body, malformed bodies, HTTP errors, and
   connection failures.
+- `tests/conftest.py` — the shared `judge_server` fixture (local scripted judge over
+  a real socket, used by integration and CLI tests).
 - `tests/helpers.py` — shared builders plus `ScriptedJudge`, an `httpx.MockTransport`
   handler that replays scripted `(status, body)` responses and records every request.
   Unit tests never touch a socket; integration tests loop back to localhost — the suite
