@@ -183,6 +183,41 @@ except ActionBlocked as blocked:
 `ActionBlocked` is raised for both `BLOCK` and `ESCALATE` (unless an escalation
 handler approved it), so unreviewed work can never reach the executor.
 
+## Command line
+
+Installing the package provides an `agent-kernel` command (also runnable as
+`python -m agent_kernel`):
+
+```bash
+agent-kernel run_bash \
+  --args '{"cmd": "rm -rf build/"}' \
+  --rationale "clean stale artifacts" \
+  --task "rebuild the wheel" \
+  --history "read_file pyproject.toml"
+```
+
+The decision is printed to stdout as JSON; the exit code is scriptable:
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | `ALLOW` |
+| 1 | error (bad input, network/judge failure) |
+| 2 | usage error |
+| 3 | `ESCALATE` |
+| 4 | `BLOCK` |
+
+```bash
+if agent-kernel write_file --args '{"path": "/etc/hosts"}' > decision.json; then
+  run_the_tool
+else
+  cat decision.json
+fi
+```
+
+Add `--interactive` to resolve `ESCALATE` verdicts at the prompt (allow / block /
+hold). Connection options: `--api-base-url`, `--model`, `--api-key` (or
+`AGENT_KERNEL_API_KEY`), `--timeout`, `--retries`.
+
 ## Development
 
 The project targets Python >= 3.11 and is developed inside WSL Debian.
