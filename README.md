@@ -93,6 +93,55 @@ reasoning; `decide(action)` additionally applies the policy gate and returns a
   on bad judge output.
 
 
+## Observability
+
+### Logging
+
+The kernel logs through the standard library under the `agent_kernel.engine` logger
+(a child of `agent_kernel`), with structured fields attached to every record:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+| Event | Level | Extra fields |
+| --- | --- | --- |
+| decision made | `ALLOW` → INFO, `ESCALATE` → WARNING, `BLOCK` → ERROR | `request_id`, `verdict`, `tool_name`, `selected_tool`, `risk_score`, `confidence`, `latency_ms`, `model_alias`, `reason` |
+| request retry | WARNING | `request_id`, `attempt`, `max_retries`, `status_code` |
+| malformed / non-JSON judge response | ERROR | `request_id`, `tool_name` |
+| HTTP failure | ERROR | `request_id`, `status_code` |
+
+`decide()` issues exactly one decision record per call; `evaluate()`-level events
+(request start at DEBUG, retries, parse/HTTP failures) carry the same `request_id`,
+so a single request can be traced end to end.
+
+### Audit trail
+
+Every `decide()` call produces one `AuditEntry`:
+
+```python
+from agent_kernel import AuditEntry, JevSupervisorEngine
+
+def persist(entry: AuditEntry) -> None:
+    db.insert(entry.model_dump(mode="json"))
+
+engine = JevSupervisorEngine(on_decision=persist)   # synchronous hook
+engine = JevSupervisorEngine(audit_history_limit=0) # hook only, no history
+
+decision = await engine.decide(action)
+assert engine.audit[-1].decision == decision         # in-memory history
+engine.clear_audit()
+```
+
+- `engine.audit` — tuple of entries, oldest first, bounded by `audit_history_limit`
+  (default 1000; `0` disables history).
+- `AuditEntry` — `request_id`, UTC `timestamp`, `model_alias`, `latency_ms`, the full
+  `action`, and the final `decision`.
+- `on_decision` is called synchronously after every decision. If it raises, the
+  exception is logged and the decision is still returned — a broken audit sink can
+  never block or alter governance.
+
 ## Development
 
 The project targets Python >= 3.11 and is developed inside WSL Debian.
@@ -105,8 +154,15 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q --cov=agent_kernel --cov-report=term-missing
 ```
 
-Tests live in `tests/test_engine.py` and cover the policy gate (including threshold
-boundaries and custom thresholds), the models (range and registry validation), prompt
-construction, response parsing (malformed, duplicate, out-of-range), fail-closed
-`decide()`, and HTTP behaviour (retries, backoff, auth headers, pass-through body).
-Network calls are always mocked — the suite never hits a live endpoint.
+Two test files:
+
+- `tests/test_engine.py` — policy gate (threshold boundaries, custom thresholds,
+  unauthorized/mismatch rules), models (range and registry validation), prompt
+  construction, response parsing, fail-closed `decide()`, HTTP retries/auth/pass-through,
+  and observability (audit entries, hooks, log levels and fields).
+- `tests/test_http_integration.py` — end-to-end runs against a local judge server over
+  a real socket: retries, bearer auth, request body, malformed bodies, HTTP errors, and
+  connection failures.
+
+Network calls are always mocked or looped back to localhost — the suite never hits a
+live endpoint.

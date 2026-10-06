@@ -1,4 +1,5 @@
 import json
+import logging
 
 import httpx
 import pytest
@@ -6,6 +7,7 @@ from pydantic import ValidationError
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from agent_kernel import (
+    AuditEntry,
     DecisionResult,
     JevSupervisorEngine,
     PolicyGater,
@@ -553,6 +555,182 @@ class TestHttpResilience:
         engine = JevSupervisorEngine(api_base_url="http://localhost")
         assert engine.api_key == "sk-env"
         assert engine._headers() == {"Authorization": "Bearer sk-env"}
+        await engine.close()
+
+
+# ── Observability tests ─────────────────────────────────────────────────────
+
+class TestObservability:
+    @pytest.mark.asyncio
+    async def test_audit_entry_recorded(self):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
+            decision = await engine.decide(make_action())
+        entries = engine.audit
+        assert len(entries) == 1
+        entry = entries[0]
+        assert isinstance(entry, AuditEntry)
+        assert entry.decision == decision
+        assert entry.request_id
+        assert entry.model_alias == "jev-latest"
+        assert entry.latency_ms >= 0
+        assert entry.action.tool_name == "read_file"
+        assert entry.timestamp.tzinfo is not None
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_on_decision_hook_receives_every_entry(self):
+        collected: list[AuditEntry] = []
+        engine = JevSupervisorEngine(
+            api_base_url="http://localhost", max_retries=0, on_decision=collected.append
+        )
+        for _ in range(2):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(return_value=mock_http())):
+                await engine.decide(make_action())
+        assert collected == list(engine.audit)
+        assert len(collected) == 2
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_hook_failure_does_not_break_decision(self, caplog):
+        def boom(entry: AuditEntry) -> None:
+            raise RuntimeError("hook exploded")
+
+        engine = JevSupervisorEngine(
+            api_base_url="http://localhost", max_retries=0, on_decision=boom
+        )
+        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(return_value=mock_http())):
+                decision = await engine.decide(make_action())
+        assert decision.verdict == "ALLOW"
+        assert any("on_decision hook raised" in r.getMessage() for r in caplog.records)
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_audit_history_is_bounded(self):
+        engine = JevSupervisorEngine(
+            api_base_url="http://localhost", max_retries=0, audit_history_limit=2
+        )
+        request_ids = []
+        for _ in range(3):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(return_value=mock_http())):
+                await engine.decide(make_action())
+            request_ids.append(engine.audit[-1].request_id)
+        assert len(engine.audit) == 2
+        assert [e.request_id for e in engine.audit] == request_ids[1:]
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_audit_history_can_be_disabled_but_hook_still_fires(self):
+        collected: list[AuditEntry] = []
+        engine = JevSupervisorEngine(
+            api_base_url="http://localhost", max_retries=0,
+            audit_history_limit=0, on_decision=collected.append,
+        )
+        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
+            await engine.decide(make_action())
+        assert engine.audit == ()
+        assert len(collected) == 1
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_clear_audit(self):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
+            await engine.decide(make_action())
+        assert len(engine.audit) == 1
+        engine.clear_audit()
+        assert engine.audit == ()
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_request_ids_are_unique_per_decision(self):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=mock_http())):
+            first = await engine.decide(make_action())
+            second = await engine.decide(make_action())
+        ids = [e.request_id for e in engine.audit]
+        assert len(set(ids)) == 2
+        await engine.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "prob,conf,blast,expected_verdict,expected_level,expected_risk",
+        [
+            pytest.param(0.10, 0.95, 1.0, "ALLOW", logging.INFO, 1.0, id="allow"),
+            pytest.param(0.60, 0.95, 1.0, "ESCALATE", logging.WARNING, 1.0, id="escalate"),
+            pytest.param(0.95, 0.99, 5.0, "BLOCK", logging.ERROR, 5.0, id="block"),
+        ],
+    )
+    async def test_decision_log_level_and_structured_fields(
+        self, caplog, prob, conf, blast, expected_verdict, expected_level, expected_risk
+    ):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        payload = {"choices": [choice("read_file", conf), noul(prob), score(blast)]}
+        with caplog.at_level(logging.DEBUG, logger="agent_kernel.engine"):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(return_value=mock_http(payload))):
+                decision = await engine.decide(make_action())
+        assert decision.verdict == expected_verdict
+        record = next(
+            r for r in caplog.records
+            if getattr(r, "verdict", None) == expected_verdict
+            and getattr(r, "tool_name", None) == "read_file"
+        )
+        assert record.levelno == expected_level
+        assert record.request_id
+        assert record.selected_tool == "read_file"
+        assert record.tool_name == "read_file"
+        assert record.risk_score == expected_risk
+        assert record.confidence == conf
+        assert record.latency_ms >= 0
+        assert record.model_alias == "jev-latest"
+        assert record.reason
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_logged_as_warning_with_context(self, caplog):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=1, backoff_base=0)
+        with caplog.at_level(logging.WARNING, logger="agent_kernel.engine"):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(side_effect=[mock_http(status_code=500), mock_http()])):
+                await engine.evaluate(make_action())
+        retry = [r for r in caplog.records if getattr(r, "attempt", None) == 1]
+        assert retry, "expected a retry log record"
+        assert retry[0].levelno == logging.WARNING
+        assert retry[0].status_code == 500
+        assert retry[0].request_id
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_malformed_response_logs_error_and_still_escalates(self, caplog):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        payload = {"choices": [choice(), noul()]}
+        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
+            with patch.object(engine._get_client(), "post",
+                              new=AsyncMock(return_value=mock_http(payload))):
+                decision = await engine.decide(make_action())
+        assert decision.verdict == "ESCALATE"
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("malformed response" in r.getMessage() for r in errors)
+        assert len(engine.audit) == 1
+        assert engine.audit[0].decision.verdict == "ESCALATE"
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_http_error_logged_with_status(self, caplog):
+        engine = JevSupervisorEngine(api_base_url="http://localhost", max_retries=0)
+        bad = mock_http(status_code=500)
+        bad.raise_for_status.side_effect = http_error(bad)
+        with caplog.at_level(logging.ERROR, logger="agent_kernel.engine"):
+            with patch.object(engine._get_client(), "post", new=AsyncMock(return_value=bad)):
+                with pytest.raises(httpx.HTTPStatusError):
+                    await engine.evaluate(make_action())
+        errors = [r for r in caplog.records if getattr(r, "status_code", None) == 500]
+        assert errors and errors[0].levelno == logging.ERROR
         await engine.close()
 
 

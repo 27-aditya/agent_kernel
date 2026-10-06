@@ -1,6 +1,11 @@
 import asyncio
+import logging
 import os
-from typing import Any, Optional
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 import httpx
 from pydantic import ValidationError
@@ -8,6 +13,7 @@ from pydantic import ValidationError
 from agent_kernel.exceptions import ResponseParseError
 from agent_kernel.models import (
     VALID_TOOLS,
+    AuditEntry,
     DecisionResult,
     JevChoiceOutput,
     JevNoulOutput,
@@ -17,7 +23,11 @@ from agent_kernel.models import (
 )
 from agent_kernel.policy import PolicyGater
 
+logger = logging.getLogger("agent_kernel.engine")
+
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+_VERDICT_LOG_LEVELS = {"ALLOW": logging.INFO, "ESCALATE": logging.WARNING, "BLOCK": logging.ERROR}
 
 
 class JevSupervisorEngine:
@@ -31,6 +41,8 @@ class JevSupervisorEngine:
         backoff_base: float = 0.5,
         extra_body: Optional[dict[str, Any]] = None,
         policy: Optional[PolicyGater] = None,
+        on_decision: Optional[Callable[[AuditEntry], None]] = None,
+        audit_history_limit: int = 1000,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
         self.model_alias = model_alias
@@ -40,7 +52,17 @@ class JevSupervisorEngine:
         self.backoff_base = backoff_base
         self.extra_body = dict(extra_body or {})
         self._policy = policy or PolicyGater()
+        self._on_decision = on_decision
+        self._audit: deque[AuditEntry] = deque(maxlen=max(0, audit_history_limit))
         self._client: Optional[httpx.AsyncClient] = None
+
+    @property
+    def audit(self) -> tuple[AuditEntry, ...]:
+        """Most recent decision records, oldest first (bounded by audit_history_limit)."""
+        return tuple(self._audit)
+
+    def clear_audit(self) -> None:
+        self._audit.clear()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -62,57 +84,145 @@ class JevSupervisorEngine:
     async def __aexit__(self, *args):
         await self.close()
 
-    async def evaluate(self, action: ProposedAction) -> JevParallelResponse:
+    async def evaluate(
+        self,
+        action: ProposedAction,
+        request_id: Optional[str] = None,
+    ) -> JevParallelResponse:
+        request_id = request_id or uuid.uuid4().hex
+        logger.debug(
+            "judge request %s started for tool=%s", request_id, action.tool_name,
+            extra={"request_id": request_id, "tool_name": action.tool_name,
+                   "model_alias": self.model_alias},
+        )
         prompt = self._build_prompt(action)
         payload: dict[str, Any] = {
             "model": self.model_alias,
             "messages": [{"role": "user", "content": prompt}],
             **self.extra_body,
         }
-        response = await self._post_with_retry(payload)
-        response.raise_for_status()
+        response = await self._post_with_retry(payload, request_id)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(
+                "judge request %s failed with HTTP %s", request_id, response.status_code,
+                extra={"request_id": request_id, "status_code": response.status_code,
+                       "tool_name": action.tool_name},
+            )
+            raise
         try:
             data = response.json()
         except ValueError as exc:
+            logger.error(
+                "judge request %s returned a non-JSON body: %s", request_id, exc,
+                extra={"request_id": request_id, "tool_name": action.tool_name},
+            )
             raise ResponseParseError("judge response body is not valid JSON") from exc
-        return self._parse_response(data)
+        try:
+            return self._parse_response(data)
+        except ResponseParseError as exc:
+            logger.error(
+                "judge request %s returned a malformed response: %s", request_id, exc,
+                extra={"request_id": request_id, "tool_name": action.tool_name},
+            )
+            raise
 
-    async def _post_with_retry(self, payload: dict[str, Any]) -> httpx.Response:
+    async def _post_with_retry(self, payload: dict[str, Any], request_id: str) -> httpx.Response:
         client = self._get_client()
         url = f"{self.api_base_url}/models/{self.model_alias}/chat/completions"
         for attempt in range(self.max_retries + 1):
             try:
                 response = await client.post(url, json=payload, headers=self._headers())
-            except (httpx.TransportError, httpx.TimeoutException):
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempt == self.max_retries:
                     raise
+                logger.warning(
+                    "judge request %s retry %d/%d after transport error: %s",
+                    request_id, attempt + 1, self.max_retries, exc,
+                    extra={"request_id": request_id, "attempt": attempt + 1,
+                           "max_retries": self.max_retries},
+                )
             else:
                 if response.status_code not in RETRYABLE_STATUS_CODES:
                     return response
                 if attempt == self.max_retries:
                     return response
+                logger.warning(
+                    "judge request %s retry %d/%d after status=%s",
+                    request_id, attempt + 1, self.max_retries, response.status_code,
+                    extra={"request_id": request_id, "attempt": attempt + 1,
+                           "max_retries": self.max_retries,
+                           "status_code": response.status_code},
+                )
             await asyncio.sleep(self.backoff_base * (2**attempt))
         raise AssertionError("unreachable: retry loop must return or raise")
 
     async def decide(self, action: ProposedAction) -> DecisionResult:
+        request_id = uuid.uuid4().hex
+        started = time.perf_counter()
         try:
-            jev_response = await self.evaluate(action)
+            jev_response = await self.evaluate(action, request_id=request_id)
         except ResponseParseError as exc:
-            return DecisionResult(
+            decision = DecisionResult(
                 verdict="ESCALATE",
                 selected_tool=action.tool_name,
                 risk_score=0.0,
                 confidence=0.0,
                 reason=f"ESCALATED: malformed judge response ({exc}) — requires human review.",
             )
-        verdict, reason = self._policy.evaluate(jev_response, action)
-        return DecisionResult(
-            verdict=verdict,
-            selected_tool=jev_response.valid_tool.selected_option,
-            risk_score=jev_response.blast_radius.score,
-            confidence=jev_response.valid_tool.confidence,
-            reason=reason,
+        else:
+            verdict, reason = self._policy.evaluate(jev_response, action)
+            decision = DecisionResult(
+                verdict=verdict,
+                selected_tool=jev_response.valid_tool.selected_option,
+                risk_score=jev_response.blast_radius.score,
+                confidence=jev_response.valid_tool.confidence,
+                reason=reason,
+            )
+        self._record_audit(request_id, action, decision, time.perf_counter() - started)
+        return decision
+
+    def _record_audit(
+        self,
+        request_id: str,
+        action: ProposedAction,
+        decision: DecisionResult,
+        latency_s: float,
+    ) -> None:
+        entry = AuditEntry(
+            request_id=request_id,
+            timestamp=datetime.now(timezone.utc),
+            model_alias=self.model_alias,
+            latency_ms=latency_s * 1000.0,
+            action=action,
+            decision=decision,
         )
+        self._audit.append(entry)
+
+        logger.log(
+            _VERDICT_LOG_LEVELS[decision.verdict],
+            "decision %s: %s for tool=%s (risk=%.2f confidence=%.2f in %.1fms)",
+            request_id, decision.verdict, action.tool_name,
+            decision.risk_score, decision.confidence, entry.latency_ms,
+            extra={
+                "request_id": request_id,
+                "verdict": decision.verdict,
+                "selected_tool": decision.selected_tool,
+                "tool_name": action.tool_name,
+                "risk_score": decision.risk_score,
+                "confidence": decision.confidence,
+                "latency_ms": entry.latency_ms,
+                "model_alias": self.model_alias,
+                "reason": decision.reason,
+            },
+        )
+
+        if self._on_decision is not None:
+            try:
+                self._on_decision(entry)
+            except Exception:
+                logger.exception("on_decision hook raised for request %s", request_id)
 
     def _build_prompt(self, action: ProposedAction) -> str:
         return (

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -50,3 +51,12 @@ class JevParallelResponse(BaseModel):
     valid_tool: JevChoiceOutput
     is_destructive: JevNoulOutput
     blast_radius: JevScoreOutput
+
+
+class AuditEntry(BaseModel):
+    request_id: str
+    timestamp: datetime
+    model_alias: str
+    latency_ms: float
+    action: ProposedAction
+    decision: DecisionResult
