@@ -258,3 +258,13 @@ Test layout:
   handler that replays scripted `(status, body)` responses and records every request.
   Unit tests never touch a socket; integration tests loop back to localhost — the suite
   never hits a live endpoint.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same gates on push/PR against
+Python 3.11–3.13 — ruff, strict mypy, the pytest + coverage gate — and builds the
+sdist/wheel with `twine check`. To validate a release locally:
+
+```bash
+.venv/bin/pip install build twine
+.venv/bin/python -m build
+.venv/bin/twine check dist/*
+```
